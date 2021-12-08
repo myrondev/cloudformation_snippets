@@ -4,3 +4,4 @@ Resources:
     DeletionPolicy: Retain
     Properties:
       BucketName: mynewbucket33232
+# this is a comment
