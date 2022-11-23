@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+
+  ArmLatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id'
+    Description: 'Latest Amazon ECS-optimized Amazon Linux 2 (arm64) AMI'
+
+  ArmInstanceType:
+    Description: Arm-based EC2 instance type
+    Type: String
+    Default: t4g.micro
+
+  DesiredCapacity:
+    Type: Number
+    Default: '0'
+    Description: Number of instances to launch in your ECS cluster.
+
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+
+  Subnet3:
+    Type: AWS::EC2::Subnet::Id
+
+  VpcId1:
+    Type: AWS::EC2::VPC::Id
+
+
+
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  Arm64taskdefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref 'AWS::StackName', -arm64]]
+      ExecutionRoleArn: !Ref Role
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: 'attribute:ecs.cpu-architecture == arm64'
+      ContainerDefinitions:
+      - Name: nginx-app
+        Cpu: 10
+        Essential: true
+        Image: nginx:1.17.7
+        Memory: 200
+        PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+
+  ArmASGLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref ArmLatestAmiId
+      InstanceType: !Ref 'ArmInstanceType'
+      IamInstanceProfile: !Ref 'EC2InstanceProfile'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['ecs:CreateCluster', 'ecs:DeregisterContainerInstance', 'ecs:DiscoverPollEndpoint',
+              'ecs:Poll', 'ecs:RegisterContainerInstance', 'ecs:StartTelemetrySession',
+              'ecs:Submit*', 'logs:CreateLogStream', 'logs:PutLogEvents', 's3:GetBucketLocation','s3:GetObject']
+            Resource: '*'
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref 'EC2Role']
+
+  Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: AccessECR
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                Resource: '*'
+
+  ArmECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref Subnet1 #default subnets
+        - !Ref Subnet2
+        - !Ref Subnet3
+      AutoScalingGroupName: "ArmECSAutoScalingGroup"
+      LaunchConfigurationName: !Ref 'ArmASGLaunchConfiguration'
+      MinSize: '0'
+      MaxSize: '1'
+      DesiredCapacity: !Ref 'DesiredCapacity'
+      TargetGroupARNs: [!Ref 'MyFargateTargetGroup']
+      Tags:
+        - Key: Name
+          Value: !Sub 'ARM64-${ECSCluster}'
+          PropagateAtLaunch: true
+
+  FargateAlb:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: FargateAlb
+      Subnets:
+        - !Ref Subnet1 #default subnets
+        - !Ref Subnet2
+        - !Ref Subnet3
+      Type: application
+      SecurityGroups:
+        - !GetAtt FargateAlbSG.GroupId
+  MyFargateTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: MyFargateTargetGroup
+      VpcId: !Ref VpcId1
+      Protocol: HTTP
+      Port: 80
+      HealthCheckPath: /
+  Listener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref MyFargateTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref FargateAlb
+      Port: 80
+      Protocol: HTTP
+  FargateAlbSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SG for the Fargate ALB
+      GroupName: FargateAlbSG
+      SecurityGroupIngress:
+        - CidrIpv6: ::/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv6 traffic'
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv4 traffic'
+  Alb2FargateContainers:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SG for traffic between ALB and containers
+      GroupName: Alb2FargateContainers
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !GetAtt FargateAlbSG.GroupId
+          Description: 'Inbound rule for all traffic'
+
+  MyECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+    Properties:
+      LaunchType: EC2
+      Cluster:
+        Ref: "ECSCluster"
+      DesiredCount: 1
+      TaskDefinition:
+        Ref: "Arm64taskdefinition"
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      LoadBalancers:
+        - TargetGroupArn:
+            Ref: MyFargateTargetGroup
+          ContainerPort: 80
+          ContainerName: nginx-app
+
+Outputs:
+  ecscluster:
+    Value: !Ref 'ECSCluster'
+    Description: 'ECS Cluster name'
